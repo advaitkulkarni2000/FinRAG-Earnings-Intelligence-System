@@ -79,75 +79,137 @@ def clean_filing_text(raw: str) -> str:
     return '\n'.join(lines)
 
 
+def _get_filing_document_url(cik: str, accession_no: str) -> str | None:
+    """
+    Given a CIK and accession number, fetch the filing index and return
+    the URL of the primary text document (.htm or .txt).
+
+    EDGAR accession numbers look like: 0000320193-23-000106
+    The filing index lives at:
+    https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}
+    &type=10-K&dateb=&owner=include&count=10
+
+    More reliably, the index JSON is at:
+    https://data.sec.gov/submissions/CIK{cik:010d}.json
+    """
+    # Normalise accession number to the no-dash form used in URLs
+    acc_nodash = accession_no.replace("-", "")
+    cik_padded = cik.zfill(10)
+
+    # Filing index page
+    index_url = (
+        f"https://www.sec.gov/Archives/edgar/data/{cik}/"
+        f"{acc_nodash}/{acc_nodash}-index.htm"
+    )
+    resp = requests.get(index_url, headers=EDGAR_HEADERS, timeout=15)
+    if resp.status_code != 200:
+        return None
+
+    # Find the primary document — look for .htm or .txt link
+    matches = re.findall(
+        r'href="(/Archives/edgar/data/[^"]+\.(?:htm|txt))"',
+        resp.text,
+        re.IGNORECASE,
+    )
+    if not matches:
+        return None
+
+    # Prefer the file that isn't the index itself
+    for m in matches:
+        if "index" not in m.lower():
+            return f"https://www.sec.gov{m}"
+
+    return f"https://www.sec.gov{matches[0]}"
+
+
 def download_filing(
     ticker: str,
     form: str = "10-K",
     year: int = 2023,
     output_dir: Path = None,
-) -> Path:
+) -> Path | None:
     """
-    Download a single filing for a ticker and save as cleaned text.
-    Returns the path to the saved file.
+    Download a single SEC filing for a ticker and save as cleaned text.
+
+    Strategy:
+    1. Look up the ticker's CIK using EDGAR's company-tickers.json
+    2. Fetch the submissions JSON which lists all filings with accession numbers
+    3. Find the most recent filing of the requested form in the requested year
+    4. Fetch the filing index to find the primary document URL
+    5. Download, clean, and save the document text
+
+    Returns the path to the saved file, or None if the filing was not found.
+
+    Note: SEC EDGAR rate-limits to 10 requests/second. This function
+    sleeps 0.2s between requests to stay compliant.
     """
     if output_dir is None:
         output_dir = DATA_DIR / ticker.upper()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Search EDGAR for the filing
-    start = f"{year}-01-01"
-    end = f"{year}-12-31"
-    search_url = (
-        f"https://efts.sec.gov/LATEST/search-index?"
-        f"q=%22{ticker}%22&forms={form}"
-        f"&dateRange=custom&startdt={start}&enddt={end}"
-    )
-
-    print(f"  Searching EDGAR for {ticker} {form} ({year})...")
-    resp = requests.get(search_url, headers=EDGAR_HEADERS, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-
-    hits = data.get("hits", {}).get("hits", [])
-    if not hits:
-        print(f"  No {form} filing found for {ticker} in {year}")
-        return None
-
-    # Take the most recent hit
-    hit = hits[0]
-    file_info = hit.get("_source", {})
-    file_date = file_info.get("period_of_report", f"FY{year}")
-    # Normalise period string
-    period = f"FY{year}" if form == "10-K" else file_date
-
-    # Construct filing URL
-    accession = file_info.get("file_num", "")
-    entity_id = file_info.get("entity_id", "")
-    doc_url = file_info.get("file_date", "")
-
-    # Fallback: use the direct document URL if available
-    files = hit.get("_source", {}).get("file_num", "")
-
-    # Try to get the actual text document
-    # EDGAR full-text search returns a direct URL
-    filing_url = hit.get("_source", {}).get("period_of_report", "")
-    direct_url = f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&forms={form}&dateRange=custom&startdt={start}&enddt={end}&hits.hits._source=period_of_report,file_date,entity_name,file_num"
-
-    print(f"  Downloading filing text...")
-
-    # Use EDGAR full text search to get the document
-    # This is a simplified approach — production would parse the filing index
-    text_url = hit.get("_id", "")
-    if not text_url:
-        print(f"  Could not determine filing URL")
-        return None
-
-    # Save path
+    period = f"FY{year}" if form == "10-K" else str(year)
     output_path = output_dir / f"{form}_{period}.txt"
     if output_path.exists():
         print(f"  Already exists: {output_path}")
         return output_path
 
-    print(f"  Saved to: {output_path}")
+    # Step 1: resolve CIK
+    print(f"  [{ticker}] Resolving CIK...")
+    try:
+        cik = get_cik(ticker)
+    except ValueError as e:
+        print(f"  [{ticker}] ERROR: {e}")
+        return None
+    time.sleep(0.2)
+
+    # Step 2: fetch submissions JSON — contains full filing history
+    submissions_url = f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
+    resp = requests.get(submissions_url, headers=EDGAR_HEADERS, timeout=15)
+    resp.raise_for_status()
+    submissions = resp.json()
+    time.sleep(0.2)
+
+    # Step 3: find the right filing
+    filings = submissions.get("filings", {}).get("recent", {})
+    form_types  = filings.get("form", [])
+    dates       = filings.get("filingDate", [])
+    accessions  = filings.get("accessionNumber", [])
+
+    target_accession = None
+    target_date = None
+    for i, (ftype, fdate, acc) in enumerate(zip(form_types, dates, accessions)):
+        if ftype != form:
+            continue
+        filing_year = int(fdate[:4])
+        if filing_year == year or filing_year == year + 1:
+            # 10-Ks for fiscal year X are often filed in year X+1
+            target_accession = acc
+            target_date = fdate
+            break
+
+    if not target_accession:
+        print(f"  [{ticker}] No {form} found for year {year} in submissions history.")
+        return None
+
+    print(f"  [{ticker}] Found {form} filed {target_date} (accession {target_accession})")
+    time.sleep(0.2)
+
+    # Step 4: get primary document URL from filing index
+    doc_url = _get_filing_document_url(cik, target_accession)
+    if not doc_url:
+        print(f"  [{ticker}] Could not resolve primary document URL.")
+        return None
+
+    # Step 5: download and clean
+    print(f"  [{ticker}] Downloading: {doc_url}")
+    resp = requests.get(doc_url, headers=EDGAR_HEADERS, timeout=30)
+    resp.raise_for_status()
+    time.sleep(0.2)
+
+    cleaned = clean_filing_text(resp.text)
+    output_path.write_text(cleaned, encoding="utf-8")
+    size_kb = output_path.stat().st_size // 1024
+    print(f"  [{ticker}] Saved {size_kb}KB → {output_path}")
     return output_path
 
 
